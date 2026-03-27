@@ -88,18 +88,7 @@ Independent of per-device monitoring, global summary metrics are continually gen
 * **Zabbix 7.4 Requirement**: The data processing relies on capabilities standardized and tested against Zabbix 7.4.
 * **Vanilla Template**: To maintain portability, this generic iteration does not contain pre-configured triggers, dashboard widgets, graphs, or webhook integrations.
 
-## Example Repository Structure
-
-```text
-zbx-mde-health-check-template/
-├── README.md
-└── template_mde_active_devices.yaml
-```
-
 ## Contributing
 
 Contributions, issues, and feature requests are welcome! If you have optimized the internal JavaScript parsing, or implemented a robust pagination structure within Zabbix memory bounds, please feel free to submit a Pull Request.
 
-## License
-
-[Insert License Here] - Please review the LICENSE file for parameters regarding usage and distribution.
