@@ -1,0 +1,521 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+    - uuid: 7df96b18c230490a9a0a9e2307226338
+      name: Templates
+  templates:
+    - uuid: b2c3d4e5f6a4478ab1c2d3e4f5a6b7c8
+      template: 'Microsoft Defender - Active Devices'
+      name: 'Microsoft Defender - Active Devices'
+      groups:
+        - name: Templates
+      items:
+        - uuid: c3d4e5f6a7b44c8a9b1c2d3e4f5a6b7c
+          name: 'MDE merged JSON (deviceavinfo base + machines health) [MAP BY DNS] (with summary)'
+          type: SCRIPT
+          key: mde.devices.merged.raw
+          delay: 5m
+          history: 90d
+          value_type: TEXT
+          params: |
+            function formEncode(obj) {
+              var parts = [];
+              for (var k in obj) parts.push(encodeURIComponent(k) + "=" + encodeURIComponent(obj[k]));
+              return parts.join("&");
+            }
+            
+            function httpJson(method, url, headers, body) {
+              var req = new HttpRequest();
+              if (headers) for (var h in headers) req.addHeader(h + ": " + headers[h]);
+              var resp = (method === "POST") ? req.post(url, body) : req.get(url);
+              var code = req.getStatus();
+              if (code < 200 || code >= 300) throw "HTTP " + code + " from " + url + " | " + resp;
+              return JSON.parse(resp);
+            }
+            
+            function safeStr(v) {
+              if (v === null || v === undefined) return "";
+              return String(v);
+            }
+            
+            function safeKeyDns(v) {
+              var s = safeStr(v).trim();
+              if (!s) return "";
+              return s.toLowerCase();
+            }
+            
+            // Sadece istediğin 3 healthStatus
+            function isWantedHealthStatus(h) {
+              var s = safeStr(h).trim();
+              return (s === "Active" || s === "NoSensorData" || s === "NoSensorDataImpairedCommunication");
+            }
+            
+            // avModeLabel: Active / EDRBlocked / Other
+            function avModeLabelFromCode(v) {
+              var s = (v === null || v === undefined) ? "" : String(v);
+              if (s === "0") return "Active";
+              if (s === "4") return "EDRBlocked";
+              return "Other";
+            }
+            
+            // Signature state: True/False/Unknown
+            function signatureState(v) {
+              var s = safeStr(v).toLowerCase().trim();
+              if (s === "true") return "True";
+              if (s === "false") return "False";
+              return "Unknown";
+            }
+            
+            function pct(part, total) {
+              if (!total || total <= 0) return 0;
+              return Math.round((part * 10000) / total) / 100; // 2 decimal
+            }
+            
+            var tenant = "{$MDE_TENANT_ID}";
+            var clientId = "{$MDE_CLIENT_ID}";
+            var clientSecret = "{$MDE_CLIENT_SECRET}";
+            var resource = "{$MDE_RESOURCE}";
+            var topAv = "{$MDE_TOP_AVINFO}";
+            var topM = "{$MDE_TOP_MACHINES}";
+            
+            if (!tenant || !clientId || !clientSecret) {
+              throw "Missing macros: {$MDE_TENANT_ID} / {$MDE_CLIENT_ID} / {$MDE_CLIENT_SECRET}";
+            }
+            
+            // TOKEN
+            var tokenUrl = "https://login.microsoftonline.com/" + tenant + "/oauth2/v2.0/token";
+            var tokenBody = formEncode({
+              grant_type: "client_credentials",
+              client_id: clientId,
+              client_secret: clientSecret,
+              scope: resource + "/.default"
+            });
+            
+            var tokenResp = httpJson("POST", tokenUrl, {"Content-Type":"application/x-www-form-urlencoded"}, tokenBody);
+            var token = tokenResp.access_token;
+            if (!token) throw "No access_token returned";
+            
+            var authHeaders = {"Authorization":"Bearer " + token};
+            
+            // deviceavinfo
+            var avUrl = resource + "/api/deviceavinfo?$top=" + encodeURIComponent(topAv) +
+              "&$select=machineId,computerDnsName,avMode,avIsSignatureUpToDate,avSignatureUpdateTime,lastSeenTime";
+            
+            var avData = httpJson("GET", avUrl, authHeaders, null);
+            var avArr = avData.value ? avData.value : [];
+            
+            // avinfo id set
+            var avSet = {};
+            for (var i = 0; i < avArr.length; i++) {
+              var mid = safeStr(avArr[i].machineId);
+              if (mid) avSet[mid] = true;
+            }
+            
+            // machines (healthStatus)
+            var mUrl = resource + "/api/machines?$top=" + encodeURIComponent(topM) +
+              "&$select=id,healthStatus";
+            
+            var mData = httpJson("GET", mUrl, authHeaders, null);
+            var mArr = mData.value ? mData.value : [];
+            
+            var mMap = {};
+            for (var j = 0; j < mArr.length; j++) {
+              var id = safeStr(mArr[j].id);
+              if (!id) continue;
+              if (avSet[id]) mMap[id] = safeStr(mArr[j].healthStatus);
+            }
+            
+            var devices = {};
+            
+            // counters
+            var c_av_active = 0, c_av_block = 0, c_av_other = 0;
+            var c_h_active = 0, c_h_nos = 0, c_h_imp = 0;
+            var c_s_true = 0, c_s_false = 0, c_s_unk = 0;
+            
+            for (var k = 0; k < avArr.length; k++) {
+              var r = avArr[k];
+              var mid2 = safeStr(r.machineId);
+              if (!mid2) continue;
+            
+              var dnsKey = safeKeyDns(r.computerDnsName);
+              if (!dnsKey) continue;
+            
+              var hs = mMap[mid2] ? mMap[mid2] : "";
+              if (!isWantedHealthStatus(hs)) continue;
+            
+              var sigState = signatureState(r.avIsSignatureUpToDate);
+              var avLabel = avModeLabelFromCode(r.avMode);
+            
+              if (avLabel === "Active") c_av_active++;
+              else if (avLabel === "EDRBlocked") c_av_block++;
+              else c_av_other++;
+            
+              if (hs === "Active") c_h_active++;
+              else if (hs === "NoSensorData") c_h_nos++;
+              else if (hs === "NoSensorDataImpairedCommunication") c_h_imp++;
+            
+              if (sigState === "True") c_s_true++;
+              else if (sigState === "False") c_s_false++;
+              else c_s_unk++;
+            
+              devices[dnsKey] = {
+                healthStatus: hs,
+                signatureState: sigState,
+                avModeLabel: avLabel,
+                lastSeenTime: safeStr(r.lastSeenTime),
+                avSignatureUpdateTime: safeStr(r.avSignatureUpdateTime),
+                avIsSignatureUpToDate: safeStr(r.avIsSignatureUpToDate)
+              };
+            }
+            
+            var total = 0;
+            for (var key in devices) { if (devices.hasOwnProperty(key)) total++; }
+            
+            var summary = {
+              total: total,
+              avMode: {
+                Active:     { count: c_av_active, pct: pct(c_av_active, total) },
+                EDRBlocked: { count: c_av_block,  pct: pct(c_av_block, total) },
+                Other:      { count: c_av_other,  pct: pct(c_av_other, total) }
+              },
+              healthStatus: {
+                Active: { count: c_h_active, pct: pct(c_h_active, total) },
+                NoSensorData: { count: c_h_nos, pct: pct(c_h_nos, total) },
+                NoSensorDataImpairedCommunication: { count: c_h_imp, pct: pct(c_h_imp, total) }
+              },
+              signatureState: {
+                True: { count: c_s_true, pct: pct(c_s_true, total) },
+                False: { count: c_s_false, pct: pct(c_s_false, total) },
+                Unknown: { count: c_s_unk, pct: pct(c_s_unk, total) }
+              }
+            };
+            
+            return JSON.stringify({ summary: summary, devices: devices });
+          timeout: 90s
+        - uuid: e5f6a7b8c9d44e0fa1b2c3d4e5f6a7b8
+          name: 'MDE Summary - AV Mode Active (count)'
+          type: DEPENDENT
+          key: mde.summary.avmode.active.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.avMode.Active.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: b8c9d0e1f2a44b3ca1b2c3d4e5f6a7b8
+          name: 'MDE Summary - AV Mode Active (%)'
+          type: DEPENDENT
+          key: mde.summary.avmode.active.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.avMode.Active.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: f6a7b8c9d0e44f1aa1b2c3d4e5f6a7b8
+          name: 'MDE Summary - AV Mode EDRBlocked (count)'
+          type: DEPENDENT
+          key: mde.summary.avmode.edrblocked.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.avMode.EDRBlocked.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: c9d0e1f2a3b44c5da1b2c3d4e5f6a7b8
+          name: 'MDE Summary - AV Mode EDRBlocked (%)'
+          type: DEPENDENT
+          key: mde.summary.avmode.edrblocked.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.avMode.EDRBlocked.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: a7b8c9d0e1f44a2ba1b2c3d4e5f6a7b8
+          name: 'MDE Summary - AV Mode Other (count)'
+          type: DEPENDENT
+          key: mde.summary.avmode.other.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.avMode.Other.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: d0e1f2a3b4c44d6ea1b2c3d4e5f6a7b8
+          name: 'MDE Summary - AV Mode Other (%)'
+          type: DEPENDENT
+          key: mde.summary.avmode.other.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.avMode.Other.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: e1f2a3b4c5d44e7fa1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Health Active (count)'
+          type: DEPENDENT
+          key: mde.summary.health.active.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.healthStatus.Active.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: b4c5d6e7f8a44b0ca1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Health Active (%)'
+          type: DEPENDENT
+          key: mde.summary.health.active.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.healthStatus.Active.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: a3b4c5d6e7f44a9ba1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Health NoSensorDataImpairedCommunication (count)'
+          type: DEPENDENT
+          key: mde.summary.health.impaired.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.healthStatus.NoSensorDataImpairedCommunication.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: d6e7f8a9b0c44d2ea1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Health NoSensorDataImpairedCommunication (%)'
+          type: DEPENDENT
+          key: mde.summary.health.impaired.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.healthStatus.NoSensorDataImpairedCommunication.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: f2a3b4c5d6e44f8aa1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Health NoSensorData (count)'
+          type: DEPENDENT
+          key: mde.summary.health.nosensordata.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.healthStatus.NoSensorData.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: c5d6e7f8a9b44c1da1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Health NoSensorData (%)'
+          type: DEPENDENT
+          key: mde.summary.health.nosensordata.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.healthStatus.NoSensorData.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: f8a9b0c1d2e44f4aa1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Signature False (count)'
+          type: DEPENDENT
+          key: mde.summary.signature.false.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.signatureState.False.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: c1d2e3f4a5b44c7da1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Signature False (%)'
+          type: DEPENDENT
+          key: mde.summary.signature.false.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.signatureState.False.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: e7f8a9b0c1d44e3fa1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Signature True (count)'
+          type: DEPENDENT
+          key: mde.summary.signature.true.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.signatureState.True.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: b0c1d2e3f4a44b6ca1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Signature True (%)'
+          type: DEPENDENT
+          key: mde.summary.signature.true.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.signatureState.True.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: a9b0c1d2e3f44a5ba1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Signature Unknown (count)'
+          type: DEPENDENT
+          key: mde.summary.signature.unknown.count
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.signatureState.Unknown.count
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: d2e3f4a5b6c44d8ea1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Signature Unknown (%)'
+          type: DEPENDENT
+          key: mde.summary.signature.unknown.pct
+          history: 90d
+          value_type: FLOAT
+          units: '%'
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.signatureState.Unknown.pct
+          master_item:
+            key: mde.devices.merged.raw
+        - uuid: d4e5f6a7b8c44d9ea1b2c3d4e5f6a7b8
+          name: 'MDE Summary - Total devices'
+          type: DEPENDENT
+          key: mde.summary.total
+          history: 90d
+          value_type: FLOAT
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.summary.total
+          master_item:
+            key: mde.devices.merged.raw
+      discovery_rules:
+        - uuid: e3f4a5b6c7d44e9fa1b2c3d4e5f6a7b8
+          name: 'MDE Active devices discovery (by DNS key)'
+          type: DEPENDENT
+          key: mde.discovery.active.items
+          lifetime: 30d
+          enabled_lifetime_type: DISABLE_NEVER
+          item_prototypes:
+            - uuid: b6c7d8e9f0a44b2ca1b2c3d4e5f6a7b8
+              name: 'MDE [{#DNSNAME}] avModeLabel'
+              type: DEPENDENT
+              key: 'mde.avModeLabel[{#DNSNAME}]'
+              value_type: TEXT
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices["{#DNSNAME}"].avModeLabel'
+              master_item:
+                key: mde.devices.merged.raw
+            - uuid: c7d8e9f0a1b44c3da1b2c3d4e5f6a7b8
+              name: 'MDE [{#DNSNAME}] avSignatureUpdateTime'
+              type: DEPENDENT
+              key: 'mde.avSignatureUpdateTime[{#DNSNAME}]'
+              value_type: TEXT
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices["{#DNSNAME}"].avSignatureUpdateTime'
+              master_item:
+                key: mde.devices.merged.raw
+            - uuid: f4a5b6c7d8e44f0aa1b2c3d4e5f6a7b8
+              name: 'MDE [{#DNSNAME}] healthStatus'
+              type: DEPENDENT
+              key: 'mde.healthStatus[{#DNSNAME}]'
+              value_type: TEXT
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices["{#DNSNAME}"].healthStatus'
+              master_item:
+                key: mde.devices.merged.raw
+            - uuid: d8e9f0a1b2c44d4ea1b2c3d4e5f6a7b8
+              name: 'MDE [{#DNSNAME}] lastSeenTime'
+              type: DEPENDENT
+              key: 'mde.lastSeenTime[{#DNSNAME}]'
+              value_type: TEXT
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices["{#DNSNAME}"].lastSeenTime'
+              master_item:
+                key: mde.devices.merged.raw
+            - uuid: a5b6c7d8e9f44a1ba1b2c3d4e5f6a7b8
+              name: 'MDE [{#DNSNAME}] signatureState'
+              type: DEPENDENT
+              key: 'mde.signatureState[{#DNSNAME}]'
+              value_type: TEXT
+              preprocessing:
+                - type: JSONPATH
+                  parameters:
+                    - '$.devices["{#DNSNAME}"].signatureState'
+              master_item:
+                key: mde.devices.merged.raw
+          master_item:
+            key: mde.devices.merged.raw
+          preprocessing:
+            - type: JAVASCRIPT
+              parameters:
+                - |
+                  var res = [];
+                  var obj = JSON.parse(value);
+                  var devices = obj.devices ? obj.devices : {};
+                  for (var dns in devices) {
+                    if (!devices.hasOwnProperty(dns)) continue;
+                    res.push({"{#DNSNAME}": String(dns)});
+                  }
+                  return JSON.stringify(res);
+      macros:
+        - macro: '{$MDE_CLIENT_ID}'
+          type: SECRET_TEXT
+        - macro: '{$MDE_CLIENT_SECRET}'
+          type: SECRET_TEXT
+        - macro: '{$MDE_RESOURCE}'
+          value: 'https://api.securitycenter.microsoft.com'
+        - macro: '{$MDE_TENANT_ID}'
+          type: SECRET_TEXT
+        - macro: '{$MDE_TOP_AVINFO}'
+          value: '10000'
+        - macro: '{$MDE_TOP_MACHINES}'
+          value: '10000'
